@@ -1,0 +1,18 @@
+{
+  "name": "SmartPresence — AI Attendance System",
+  "short_name": "SmartPresence",
+  "description": "AI-Integrated Attendance Management System with Dynamic QR, Facial Liveness & Biometric Recognition.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#080F1F",
+  "theme_color": "#6366F1",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
