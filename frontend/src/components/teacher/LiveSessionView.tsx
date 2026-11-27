@@ -48,6 +48,13 @@ export function LiveSessionView() {
   const [geofenceRadius, setGeofenceRadius] = useState<number>(150);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [lastLiveEvent, setLastLiveEvent] = useState<{
+    student_name: string;
+    roll_number: string;
+    subject_code: string;
+    classroom: string;
+    timestamp: string;
+  } | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
 
@@ -114,7 +121,21 @@ export function LiveSessionView() {
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
-    ws.onmessage = () => {
+    ws.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        if (msg?.type === 'attendance_marked') {
+          setLastLiveEvent({
+            student_name: msg.student_name || 'Student',
+            roll_number: msg.roll_number || '',
+            subject_code: msg.subject_code || '',
+            classroom: msg.classroom || 'Classroom',
+            timestamp: msg.timestamp || new Date().toISOString(),
+          });
+        }
+      } catch {
+        // Ignore non-JSON ping frames
+      }
       fetchSessionDetail(selectedSessionId);
       fetchInitialData();
     };
@@ -575,32 +596,61 @@ export function LiveSessionView() {
                   <span className="text-[10px] text-emerald-400 font-mono">WebSocket Synced</span>
                 </div>
 
+                {lastLiveEvent && (
+                  <div className="p-3 rounded-xl bg-emerald-950/50 border border-emerald-500/40 text-xs text-emerald-200 space-y-0.5">
+                    <div className="font-bold text-emerald-300">
+                      New Verified Submission: {lastLiveEvent.student_name} ({lastLiveEvent.roll_number})
+                    </div>
+                    <div className="text-[11px] text-slate-200">
+                      Class: <span className="font-semibold">{lastLiveEvent.subject_code || sessionDetail.subject_code}</span> ({lastLiveEvent.classroom}) •{' '}
+                      {new Date(lastLiveEvent.timestamp).toLocaleDateString(undefined, { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric' })}{' '}
+                      at{' '}
+                      <span className="font-mono text-cyan-300">
+                        {new Date(lastLiveEvent.timestamp).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                      </span>
+                    </div>
+                  </div>
+                )}
+
                 {sessionDetail.students.length === 0 ? (
                   <p className="text-xs text-slate-400 py-4 text-center">No enrolled students found for this subject.</p>
                 ) : (
                   <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
-                    {sessionDetail.students.map((stu) => (
-                      <div
-                        key={stu.student_id}
-                        className="p-3 rounded-xl bg-white/[0.03] border border-white/5 flex items-center justify-between text-xs"
-                      >
-                        <div>
-                          <div className="font-semibold text-slate-100">{stu.full_name}</div>
-                          <div className="text-[10px] text-slate-400 font-mono">{stu.roll_number}</div>
-                        </div>
-                        <span
-                          className={`px-2 py-0.5 rounded-md text-[10px] font-bold ${
-                            stu.status === 'PRESENT' || stu.status === 'MANUAL_OVERRIDE'
-                              ? 'bg-emerald-500/20 text-emerald-300'
-                              : stu.status === 'PENDING_VERIFICATION'
-                              ? 'bg-amber-500/20 text-amber-300'
-                              : 'bg-slate-800 text-slate-400'
-                          }`}
+                    {sessionDetail.students.map((stu) => {
+                      const markedDt = stu.marked_at ? new Date(stu.marked_at) : null;
+                      return (
+                        <div
+                          key={stu.student_id}
+                          className="p-3 rounded-xl bg-white/[0.03] border border-white/5 flex flex-wrap items-center justify-between gap-2 text-xs"
                         >
-                          {stu.status === 'PENDING_VERIFICATION' ? 'QR SCANNED • FACE PENDING' : stu.status}
-                        </span>
-                      </div>
-                    ))}
+                          <div>
+                            <div className="font-semibold text-slate-100">{stu.full_name}</div>
+                            <div className="text-[10px] text-slate-400 font-mono">
+                              {stu.roll_number} • {sessionDetail.subject_code} ({sessionDetail.classroom || 'Classroom'})
+                            </div>
+                            {markedDt && (
+                              <div className="text-[10px] text-cyan-300 mt-0.5">
+                                {markedDt.toLocaleDateString(undefined, { weekday: 'short', day: '2-digit', month: 'short', year: 'numeric' })} •{' '}
+                                <span className="font-mono">
+                                  {markedDt.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                                </span>
+                              </div>
+                            )}
+                          </div>
+                          <span
+                            className={`px-2 py-0.5 rounded-md text-[10px] font-bold ${
+                              stu.status === 'PRESENT' || stu.status === 'MANUAL_OVERRIDE'
+                                ? 'bg-emerald-500/20 text-emerald-300'
+                                : stu.status === 'PENDING_VERIFICATION'
+                                ? 'bg-amber-500/20 text-amber-300'
+                                : 'bg-slate-800 text-slate-400'
+                            }`}
+                          >
+                            {stu.status === 'PENDING_VERIFICATION' ? 'QR SCANNED • FACE PENDING' : stu.status}
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>

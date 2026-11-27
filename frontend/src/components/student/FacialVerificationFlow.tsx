@@ -1,16 +1,22 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import {
-  Camera,
   CheckCircle2,
   AlertCircle,
-  Loader2,
   ShieldCheck,
-  RefreshCw,
   XCircle,
-  Accessibility,
   MapPin,
+  FlipHorizontal,
 } from 'lucide-react';
 import { api, VerificationInitResponse } from '../../services/api';
+import {
+  acquireCameraStream,
+  attachStreamToVideo,
+  stopGlobalCameraStream,
+  formatCameraError,
+  CameraFacing,
+} from '../../services/cameraService';
+import { getCurrentGeoPosition } from '../../services/geolocationService';
+import { ErrorBoundary } from '../common/ErrorBoundary';
 
 interface FacialVerificationFlowProps {
   transaction: VerificationInitResponse;
@@ -38,7 +44,6 @@ const STAGE_LIST: { id: StageId; label: string }[] = [
 ];
 
 export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: FacialVerificationFlowProps) {
-  const [challenges, setChallenges] = useState<string[]>(transaction.active_challenges);
   const [geofenceVerified, setGeofenceVerified] = useState<boolean>(!transaction.geofence_required);
   const [geofenceInfo, setGeofenceInfo] = useState<string | null>(
     transaction.geofence_required ? null : 'Optional for this session'
@@ -47,9 +52,12 @@ export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: F
 
   const [cameraReady, setCameraReady] = useState(false);
   const [videoLive, setVideoLive] = useState(false);
+  const [facingMode, setFacingMode] = useState<CameraFacing>('user');
+  const [streamResolution, setStreamResolution] = useState<string | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [captureProgress, setCaptureProgress] = useState<string | null>(null);
   const [currentStage, setCurrentStage] = useState<StageId | null>(null);
+
   const [completedStages, setCompletedStages] = useState<Set<StageId>>(
     () => (transaction.geofence_required ? new Set() : new Set<StageId>(['GEOFENCE']))
   );
@@ -58,15 +66,23 @@ export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: F
   const [receipt, setReceipt] = useState<{
     record_id: string;
     marked_at: string;
+    subject_code: string;
+    subject_name: string;
     liveness_score: number | null;
     cosine_similarity: number | null;
   } | null>(null);
+  const [autoPipelineTriggered, setAutoPipelineTriggered] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  // Guard against React StrictMode double-mount
+  const cameraStartingRef = useRef(false);
+  const autoCameraStartedRef = useRef(false);
 
   const stopCamera = useCallback(() => {
+    cameraStartingRef.current = false;
+    stopGlobalCameraStream('facial-verification');
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
@@ -76,6 +92,7 @@ export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: F
     }
     setCameraReady(false);
     setVideoLive(false);
+    setStreamResolution(null);
   }, []);
 
   useEffect(() => {
@@ -84,30 +101,16 @@ export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: F
 
   const verifyGpsLocation = useCallback(async () => {
     setError(null);
-    if (!navigator.geolocation) {
-      if (transaction.geofence_required) {
-        setError('Geolocation is unavailable in this browser but required by your instructor.');
-        return false;
-      }
-      return true;
-    }
-
     setCheckingGeo(true);
     setCurrentStage('GEOFENCE');
     try {
-      const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
-        navigator.geolocation.getCurrentPosition(resolve, reject, {
-          enableHighAccuracy: true,
-          timeout: 10000,
-          maximumAge: 0,
-        });
-      });
+      const pos = await getCurrentGeoPosition();
 
       const res = await api.post('/verification/geofence', {
         transaction_id: transaction.transaction_id,
-        latitude: pos.coords.latitude,
-        longitude: pos.coords.longitude,
-        accuracy_meters: pos.coords.accuracy,
+        latitude: pos.latitude,
+        longitude: pos.longitude,
+        accuracy_meters: pos.accuracy,
       });
       setGeofenceVerified(true);
       setGeofenceInfo(res.data.detail);
@@ -129,89 +132,164 @@ export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: F
     }
   }, [transaction.geofence_required, transaction.transaction_id]);
 
+  // Auto-run GPS verification if required
   useEffect(() => {
     if (transaction.geofence_required) {
       void verifyGpsLocation();
     }
   }, [transaction.geofence_required, verifyGpsLocation]);
 
-  const startFrontCamera = async () => {
+  /**
+   * startFrontCamera — robust version for desktop + mobile browsers.
+   *
+   * Key fixes:
+   *  1. Guard cameraStartingRef prevents duplicate calls (React StrictMode, button double-tap).
+   *  2. We set srcObject and all video attributes BEFORE calling play().
+   *  3. We call play() ONLY inside onloadedmetadata so the stream is guaranteed decoded.
+   *  4. Fallback: if readyState >= HAVE_ENOUGH_DATA the metadata already fired; play immediately.
+   *  5. We listen to oncanplay / onplaying as additional signals to set videoLive.
+   */
+  const startFrontCamera = async (targetFacing: CameraFacing = facingMode) => {
+    if (cameraStartingRef.current) return;
+    cameraStartingRef.current = true;
+
     setCameraError(null);
     setError(null);
+
     if (transaction.geofence_required && !geofenceVerified) {
       const ok = await verifyGpsLocation();
-      if (!ok) return;
+      if (!ok) {
+        cameraStartingRef.current = false;
+        return;
+      }
     }
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setCameraError('Browser camera API unavailable. Open via HTTPS or localhost.');
-      return;
-    }
+
     try {
       stopCamera();
-      let stream: MediaStream;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: 'user' }, width: { ideal: 640 }, height: { ideal: 480 } },
-          audio: false,
-        });
-      } catch {
-        // Fallback if specific facingMode/resolution constraint fails on device
-        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-      }
+      cameraStartingRef.current = true;
+
+      const stream = await acquireCameraStream({
+        owner: 'facial-verification',
+        facingMode: targetFacing,
+        idealWidth: 640,
+        idealHeight: 480,
+      });
 
       streamRef.current = stream;
       setCameraReady(true);
 
-      // Attach stream directly to already-mounted <video> element to preserve mobile user gesture
       const video = videoRef.current;
-      if (video) {
-        video.srcObject = stream;
-        video.setAttribute('playsinline', 'true');
-        video.muted = true;
-        await video.play();
-        if (video.readyState >= 2 && video.videoWidth > 0) {
-          setVideoLive(true);
-        }
+      if (!video) {
+        throw new Error('Video element not mounted yet. Please retry.');
       }
+
+      attachStreamToVideo(video, stream, {
+        onLive: (res) => {
+          setVideoLive(true);
+          if (res) setStreamResolution(res);
+        },
+        onError: (msg) => {
+          setCameraError(msg);
+        },
+      });
+
       setCompletedStages((prev) => new Set([...prev, 'CAMERA_INIT']));
       setCurrentStage('CAMERA_INIT');
     } catch (err: any) {
+      console.error('[Camera] startFrontCamera error:', err);
       stopCamera();
-      setCameraError(err?.message || 'Unable to access front camera. Check permissions and retry.');
+      setCameraError(formatCameraError(err));
+    } finally {
+      cameraStartingRef.current = false;
     }
   };
 
+  // Auto-open front camera immediately once QR + credentials are verified (and GPS is satisfied)
+  useEffect(() => {
+    if (
+      transaction.next_stage === 'NON_BIOMETRIC_REVIEW' ||
+      receipt ||
+      autoCameraStartedRef.current
+    ) {
+      return;
+    }
+    if (transaction.geofence_required && !geofenceVerified) {
+      return;
+    }
+    autoCameraStartedRef.current = true;
+    void startFrontCamera('user');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [transaction.next_stage, transaction.geofence_required, geofenceVerified, receipt]);
+
+  // Auto-run face detection, liveness & authority-approved biometric match once camera is live
+  useEffect(() => {
+    if (
+      !cameraReady ||
+      !videoLive ||
+      running ||
+      receipt ||
+      autoPipelineTriggered ||
+      transaction.next_stage === 'NON_BIOMETRIC_REVIEW'
+    ) {
+      return;
+    }
+    setCaptureProgress('Face camera live — blink now...');
+    const timer = window.setTimeout(() => {
+      setAutoPipelineTriggered(true);
+      void runVerificationPipeline();
+    }, 600);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cameraReady, videoLive, running, receipt, autoPipelineTriggered, transaction.next_stage]);
+
+  const toggleFacingMode = () => {
+    const next: CameraFacing = facingMode === 'user' ? 'environment' : 'user';
+    setFacingMode(next);
+    if (cameraReady) {
+      void startFrontCamera(next);
+    }
+  };
+
+  /**
+   * captureFrameB64 — safely captures a JPEG frame from the live video element.
+   * Returns empty string if the video is not ready (guards against black frames).
+   */
   const captureFrameB64 = (): string => {
     const v = videoRef.current;
     const c = canvasRef.current;
-    if (!v || !c || v.readyState < 2 || v.videoWidth === 0 || v.videoHeight === 0) {
+    if (!v || !c) {
+      console.warn('[Capture] Video or canvas ref is null');
       return '';
     }
-    c.width = v.videoWidth;
-    c.height = v.videoHeight;
+    if (v.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      console.warn('[Capture] Video not ready — readyState:', v.readyState);
+      return '';
+    }
+    if (v.videoWidth === 0 || v.videoHeight === 0) {
+      console.warn('[Capture] Video dimensions zero — stream may still be starting');
+      return '';
+    }
+    if (v.paused || v.ended) {
+      console.warn('[Capture] Video is paused or ended');
+      return '';
+    }
+    // Scale down to max 480px width for ultra-fast mobile upload while keeping facial landmarks sharp
+    const scale = v.videoWidth > 480 ? 480 / v.videoWidth : 1;
+    c.width = Math.max(1, Math.round(v.videoWidth * scale));
+    c.height = Math.max(1, Math.round(v.videoHeight * scale));
     const ctx = c.getContext('2d');
     if (!ctx) return '';
     ctx.drawImage(v, 0, 0, c.width, c.height);
-    return c.toDataURL('image/jpeg', 0.9);
-  };
-
-  const switchAccessibleChallenge = async () => {
-    setError(null);
-    try {
-      const res = await api.post('/verification/challenge', {
-        transaction_id: transaction.transaction_id,
-        accessible_mode: true,
-      });
-      setChallenges(res.data.active_challenges);
-    } catch (err: any) {
-      setError(err?.response?.data?.detail || 'Could not switch challenge.');
+    const dataUrl = c.toDataURL('image/jpeg', 0.78);
+    if (dataUrl.length < 1000) {
+      console.warn('[Capture] Data URL suspiciously short — may be blank frame');
     }
+    return dataUrl;
   };
 
   const runVerificationPipeline = async () => {
     setError(null);
     setRunning(true);
-
     try {
       if (transaction.geofence_required && !geofenceVerified) {
         const geoOk = await verifyGpsLocation();
@@ -231,6 +309,8 @@ export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: F
         setReceipt({
           record_id: compRes.data.attendance_record_id,
           marked_at: compRes.data.marked_at,
+          subject_code: compRes.data.subject_code || transaction.subject_code,
+          subject_name: compRes.data.subject_name || transaction.subject_name,
           liveness_score: null,
           cosine_similarity: null,
         });
@@ -238,24 +318,24 @@ export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: F
       }
 
       if (!cameraReady || !videoLive) {
-        setError('Front camera stream is still initializing or blocked. Tap Retry Front Camera if preview is black.');
+        setError('Camera is not ready. Please initialize the front camera first.');
         setRunning(false);
         return;
       }
 
-      // Capture 8 frames at 280ms intervals (~2.0s) so blinks & head movements are captured cleanly
+      // Fast blink capture: 6 frames at 180 ms (~1.08s) + instant photo match & submit
       setCurrentStage('LIVENESS_RUNNING');
       const frames: string[] = [];
-      for (let i = 0; i < 8; i++) {
-        setCaptureProgress(`Capturing frame ${i + 1}/8 — perform: ${challenges.map((c) => c.replaceAll('_', ' ')).join(' & ')}`);
+      for (let i = 0; i < 6; i++) {
+        setCaptureProgress(`Blink now (${i + 1}/6)`);
+        await new Promise((r) => setTimeout(r, 180));
         const f = captureFrameB64();
         if (f) frames.push(f);
-        if (i < 7) await new Promise((r) => setTimeout(r, 280));
       }
-      setCaptureProgress('Analyzing liveness & anti-spoofing...');
+      setCaptureProgress('Verifying blink & matching photo...');
 
       if (frames.length < 3) {
-        setError('Camera returned empty frames. Please retry camera initialization.');
+        setError('Camera returned blank frames. Ensure good lighting and retry camera initialization.');
         setRunning(false);
         setCaptureProgress(null);
         return;
@@ -268,6 +348,7 @@ export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: F
       setCompletedStages((prev) => new Set([...prev, 'LIVENESS_RUNNING', 'LIVENESS_VERIFIED']));
       setCurrentStage('LIVENESS_VERIFIED');
 
+      // Identity match (ArcFace 1:1)
       setCaptureProgress('Matching 1:1 ArcFace biometric embedding...');
       setCurrentStage('IDENTITY_RUNNING');
       const frontalFrame = captureFrameB64() || frames[frames.length - 1];
@@ -277,6 +358,7 @@ export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: F
       });
       setCompletedStages((prev) => new Set([...prev, 'IDENTITY_RUNNING']));
 
+      // Record attendance
       setCaptureProgress('Recording attendance in Neon database...');
       setCurrentStage('RECORDING');
       const completeRes = await api.post('/verification/complete', {
@@ -289,6 +371,8 @@ export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: F
       setReceipt({
         record_id: completeRes.data.attendance_record_id,
         marked_at: completeRes.data.marked_at,
+        subject_code: completeRes.data.subject_code || transaction.subject_code,
+        subject_name: completeRes.data.subject_name || transaction.subject_name,
         liveness_score: completeRes.data.liveness_score,
         cosine_similarity: completeRes.data.cosine_similarity,
       });
@@ -301,7 +385,9 @@ export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: F
   };
 
   return (
+    <ErrorBoundary fallbackTitle="Facial Verification Camera Error" onReset={stopCamera}>
     <div className="glass-panel p-6 sm:p-8 rounded-3xl space-y-6">
+      {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-4">
         <div>
           <h2 className="text-lg font-bold text-white flex items-center space-x-2">
@@ -315,10 +401,7 @@ export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: F
         {!receipt && (
           <button
             type="button"
-            onClick={() => {
-              stopCamera();
-              onCancel();
-            }}
+            onClick={() => { stopCamera(); onCancel(); }}
             className="px-3 py-1.5 rounded-xl glass-panel-subtle text-xs text-slate-300 hover:bg-white/10 flex items-center space-x-1"
           >
             <XCircle className="w-3.5 h-3.5" />
@@ -327,14 +410,20 @@ export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: F
         )}
       </div>
 
-      {/* GPS Geofence Status Banner */}
+      {/* GPS Geofence */}
       <div className="p-3 rounded-xl glass-panel-subtle flex flex-wrap items-center justify-between gap-2 text-xs">
         <div className="flex items-center space-x-2">
           <MapPin className={`w-4 h-4 ${geofenceVerified ? 'text-emerald-400' : 'text-amber-400'}`} />
           <span className="text-slate-200">
-            GPS Geofence ({transaction.geofence_required ? `Required ≤ ${transaction.geofence_radius_meters}m` : 'Optional'}):
+            GPS Geofence (
+            {transaction.geofence_required
+              ? `Required ≤ ${transaction.geofence_radius_meters}m`
+              : 'Optional'}
+            ):
           </span>
-          <span className="text-cyan-300">{checkingGeo ? 'Checking coordinates...' : geofenceInfo || 'Pending check'}</span>
+          <span className="text-cyan-300">
+            {checkingGeo ? 'Checking coordinates...' : geofenceInfo || 'Pending check'}
+          </span>
         </div>
         {!geofenceVerified && (
           <button
@@ -348,6 +437,26 @@ export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: F
         )}
       </div>
 
+      {/* Stage tracker — also silences the unused currentStage variable warning */}
+      <div className="flex flex-col space-y-1.5">
+        {STAGE_LIST.map((s) => {
+          const done = completedStages.has(s.id);
+          const active = currentStage === s.id;
+          return (
+            <div key={s.id} className="flex items-center space-x-2">
+              <div
+                className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${
+                  done ? 'bg-emerald-400' : active ? 'bg-cyan-400 animate-pulse' : 'bg-slate-600'
+                }`}
+              />
+              <span className={`text-xs ${done ? 'text-emerald-300' : active ? 'text-cyan-200' : 'text-slate-400'}`}>
+                {s.label}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
       {error && (
         <div className="p-3.5 rounded-xl bg-red-950/60 border border-red-500/40 text-xs text-red-200 flex items-start space-x-2">
           <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
@@ -356,28 +465,65 @@ export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: F
       )}
 
       {receipt ? (
-        <div className="p-6 rounded-2xl bg-emerald-950/30 border border-emerald-500/40 space-y-4">
-          <div className="flex items-center space-x-3">
-            <CheckCircle2 className="w-8 h-8 text-emerald-400 shrink-0" />
-            <div>
-              <h3 className="text-base font-bold text-white">Attendance Successfully Recorded!</h3>
-              <p className="text-xs text-emerald-300">
-                Verified atomically in Neon PostgreSQL • Record ID: <span className="font-mono">{receipt.record_id}</span>
-              </p>
+        (() => {
+          const dt = new Date(receipt.marked_at);
+          const dayStr = dt.toLocaleDateString(undefined, { weekday: 'long' });
+          const dateStr = dt.toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' });
+          const timeStr = dt.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          return (
+            <div className="p-6 rounded-2xl bg-emerald-950/35 border border-emerald-500/40 space-y-4">
+              <div className="flex items-center space-x-3">
+                <CheckCircle2 className="w-9 h-9 text-emerald-400 shrink-0" />
+                <div>
+                  <h3 className="text-base font-bold text-white">Attendance Submitted &amp; Sent to Teacher Portal</h3>
+                  <p className="text-xs text-emerald-300">
+                    Matched against authority-approved biometric profile • Recorded in Neon PostgreSQL
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
+                <div className="p-3 rounded-xl bg-black/30 border border-white/10">
+                  <div className="text-[10px] text-slate-400 uppercase">Class / Subject</div>
+                  <div className="font-bold text-white mt-0.5">{receipt.subject_code}</div>
+                  <div className="text-[11px] text-slate-300 truncate">{receipt.subject_name}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-black/30 border border-white/10">
+                  <div className="text-[10px] text-slate-400 uppercase">Day</div>
+                  <div className="font-bold text-cyan-300 mt-0.5">{dayStr}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-black/30 border border-white/10">
+                  <div className="text-[10px] text-slate-400 uppercase">Date</div>
+                  <div className="font-bold text-white mt-0.5">{dateStr}</div>
+                </div>
+                <div className="p-3 rounded-xl bg-black/30 border border-white/10">
+                  <div className="text-[10px] text-slate-400 uppercase">Time</div>
+                  <div className="font-bold text-emerald-300 mt-0.5 font-mono">{timeStr}</div>
+                </div>
+              </div>
+
+              {receipt.liveness_score !== null && (
+                <div className="text-xs text-slate-300">
+                  Anti-Spoofing Liveness:{' '}
+                  <span className="font-mono text-cyan-300">{receipt.liveness_score}</span> • Authority Biometric Match:{' '}
+                  <span className="font-mono text-cyan-300">{receipt.cosine_similarity}</span> • Record:{' '}
+                  <span className="font-mono text-slate-400">{receipt.record_id.slice(0, 8)}</span>
+                </div>
+              )}
+
+              <button
+                type="button"
+                onClick={onCompleted}
+                className="btn-primary px-5 py-2.5 rounded-xl text-xs font-semibold text-white"
+              >
+                Done
+              </button>
             </div>
-          </div>
-          {receipt.liveness_score !== null && (
-            <div className="text-xs text-slate-300">
-              Anti-Spoofing Score: <span className="font-mono text-cyan-300">{receipt.liveness_score}</span> • ArcFace
-              Cosine Similarity: <span className="font-mono text-cyan-300">{receipt.cosine_similarity}</span>
-            </div>
-          )}
-          <button type="button" onClick={onCompleted} className="btn-primary px-5 py-2.5 rounded-xl text-xs font-semibold text-white">
-            Done
-          </button>
-        </div>
+          );
+        })()
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+          {/* Camera panel */}
           <div className="p-5 rounded-2xl glass-panel-subtle flex flex-col items-center space-y-4">
             {transaction.next_stage === 'NON_BIOMETRIC_REVIEW' ? (
               <div className="p-6 text-center space-y-2 text-xs text-cyan-200">
@@ -387,145 +533,123 @@ export function FacialVerificationFlow({ transaction, onCancel, onCompleted }: F
               </div>
             ) : (
               <>
-                <div className="relative w-full max-w-sm aspect-[4/3] rounded-2xl overflow-hidden bg-slate-950 border border-white/10 flex items-center justify-center">
-                  {/* Keep <video> always mounted so mobile Safari/Chrome attaches srcObject inside the user gesture */}
+                {/*
+                  VIDEO ELEMENT: Always kept mounted in the DOM so the ref is
+                  valid when startFrontCamera calls video.srcObject = stream.
+                  Hidden via CSS when camera is inactive — NOT via conditional
+                  rendering — to prevent the ref becoming null.
+                */}
+                <div
+                  className="relative w-full max-w-sm rounded-2xl overflow-hidden bg-slate-950 border border-white/10"
+                  style={{ aspectRatio: '4/3' }}
+                >
                   <video
                     ref={videoRef}
                     autoPlay
                     playsInline
                     muted
-                    onLoadedMetadata={() => {
-                      const v = videoRef.current;
-                      if (v) void v.play();
+                    className={`w-full h-full object-cover transition-opacity duration-300 ${
+                      cameraReady && videoLive ? 'opacity-100' : 'opacity-0'
+                    }`}
+                    style={{
+                      transform: facingMode === 'user' ? 'scaleX(-1)' : 'none',
                     }}
-                    onPlaying={() => setVideoLive(true)}
-                    className={`w-full h-full object-cover scale-x-[-1] ${cameraReady ? 'block' : 'hidden'}`}
                   />
-                  {cameraReady && (
-                    <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
-                      <div
-                        className={`w-44 h-56 rounded-full border-2 ${
-                          running ? 'border-cyan-400 animate-pulse' : 'border-dashed border-indigo-400/80'
-                        }`}
-                      />
-                    </div>
-                  )}
+                  <canvas ref={canvasRef} style={{ display: 'none' }} />
                   {!cameraReady && (
-                    <div className="text-center p-6 space-y-2">
-                      <Camera className="w-10 h-10 text-slate-500 mx-auto" />
-                      <p className="text-xs text-slate-400">Front camera awaiting activation</p>
+                    <div className="absolute inset-0 flex flex-col items-center justify-center space-y-2 bg-slate-950/90">
+                      <span className="text-3xl">📷</span>
+                      <p className="text-xs text-slate-400">Camera preview inactive</p>
+                    </div>
+                  )}
+                  {cameraReady && !videoLive && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center space-y-2 bg-slate-950/90">
+                      <p className="text-xs text-cyan-300 animate-pulse">Initializing front camera stream...</p>
+                    </div>
+                  )}
+                  {cameraReady && videoLive && (
+                    <div className="absolute inset-0 pointer-events-none flex flex-col items-center justify-center">
+                      <div className="w-40 h-52 rounded-full border-2 border-dashed border-cyan-400/70" />
+                      {streamResolution && (
+                        <span className="mt-2 px-2 py-0.5 rounded-full bg-black/60 text-[10px] text-emerald-300">
+                          Live {streamResolution}
+                        </span>
+                      )}
                     </div>
                   )}
                 </div>
-                <canvas ref={canvasRef} className="hidden" />
 
-                {cameraError && (
-                  <div className="w-full p-3 rounded-xl bg-amber-950/50 border border-amber-500/40 text-xs text-amber-200">
-                    {cameraError}
-                  </div>
-                )}
-
-                <div className="w-full max-w-sm p-3.5 rounded-xl bg-indigo-950/40 border border-indigo-500/30 space-y-1.5">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[11px] font-bold text-cyan-300 uppercase">Liveness Challenges</span>
-                    <button
-                      type="button"
-                      onClick={switchAccessibleChallenge}
-                      className="text-[10px] text-slate-300 hover:text-white flex items-center space-x-1"
-                    >
-                      <Accessibility className="w-3 h-3" />
-                      <span>Accessible Mode</span>
-                    </button>
-                  </div>
-                  <div className="text-xs font-semibold text-white">
-                    {captureProgress || `Perform during capture: ${challenges.map((c) => c.replaceAll('_', ' ')).join(' → ')}`}
-                  </div>
-                </div>
-
-                <div className="flex flex-wrap gap-2 w-full max-w-sm">
+                {/* Camera controls */}
+                <div className="flex flex-wrap gap-2 w-full max-w-sm justify-center">
                   {!cameraReady ? (
                     <button
                       type="button"
-                      onClick={startFrontCamera}
-                      className="flex-1 btn-primary py-2.5 px-4 rounded-xl text-xs font-semibold text-white flex items-center justify-center space-x-2"
+                      onClick={() => void startFrontCamera(facingMode)}
+                      disabled={running}
+                      className="flex-1 btn-primary py-2.5 px-4 rounded-xl text-xs font-semibold text-white"
                     >
-                      <Camera className="w-4 h-4" />
-                      <span>{cameraError ? 'Retry Front Camera' : 'Continue to Face Verification'}</span>
+                      {cameraError ? 'Retry Front Camera' : 'Open Front Camera'}
                     </button>
                   ) : (
                     <>
                       <button
                         type="button"
-                        onClick={runVerificationPipeline}
-                        disabled={running || !videoLive}
-                        className="flex-1 btn-cyan py-2.5 px-4 rounded-xl text-xs font-semibold text-white flex items-center justify-center space-x-2 disabled:opacity-60"
+                        onClick={stopCamera}
+                        className="flex-1 px-4 py-2.5 rounded-xl bg-red-600/80 hover:bg-red-600 text-xs font-semibold text-white"
                       >
-                        {running || !videoLive ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
-                        <span>
-                          {!videoLive
-                            ? 'Starting Camera...'
-                            : running
-                            ? 'Verifying Liveness & Identity...'
-                            : 'Start Verification'}
-                        </span>
+                        Stop Camera
                       </button>
                       <button
                         type="button"
-                        onClick={startFrontCamera}
-                        disabled={running}
-                        className="px-3 py-2.5 rounded-xl glass-panel-subtle text-xs text-slate-300"
-                        title="Re-initialize camera if preview looks stuck"
+                        onClick={toggleFacingMode}
+                        className="px-3.5 py-2.5 rounded-xl glass-panel hover:bg-white/10 text-xs text-slate-200 flex items-center space-x-1.5 border border-white/10"
                       >
-                        <RefreshCw className="w-3.5 h-3.5" />
+                        <FlipHorizontal className="w-4 h-4 text-cyan-400" />
+                        <span>Switch</span>
                       </button>
                     </>
                   )}
                 </div>
-              </>
-            )}
 
-            {transaction.next_stage === 'NON_BIOMETRIC_REVIEW' && (
-              <button
-                type="button"
-                onClick={runVerificationPipeline}
-                disabled={running}
-                className="btn-cyan py-2.5 px-5 rounded-xl text-xs font-semibold text-white"
-              >
-                {running ? 'Recording...' : 'Complete Verification'}
-              </button>
+                {cameraError && (
+                  <div className="w-full p-3 rounded-xl bg-amber-950/50 border border-amber-500/40 text-xs text-amber-200 flex items-start space-x-2">
+                    <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                    <span>{cameraError}</span>
+                  </div>
+                )}
+
+                {captureProgress && (
+                  <div className="w-full text-xs text-cyan-300 text-center">{captureProgress}</div>
+                )}
+              </>
             )}
           </div>
 
-          <div className="p-5 rounded-2xl glass-panel-subtle space-y-3">
-            <h3 className="text-xs font-bold text-slate-200 uppercase tracking-wider">Verification Pipeline Stages</h3>
-            <div className="space-y-2.5">
-              {STAGE_LIST.map((st) => {
-                const done = completedStages.has(st.id);
-                const active = currentStage === st.id && !done;
-                return (
-                  <div
-                    key={st.id}
-                    className={`p-3 rounded-xl text-xs flex items-center justify-between border ${
-                      done
-                        ? 'bg-emerald-950/40 border-emerald-500/40 text-emerald-200'
-                        : active
-                        ? 'bg-indigo-950/50 border-indigo-500 text-white'
-                        : 'bg-white/[0.02] border-white/5 text-slate-500'
-                    }`}
-                  >
-                    <span>{st.label}</span>
-                    {done ? (
-                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                    ) : active ? (
-                      <Loader2 className="w-4 h-4 animate-spin text-cyan-400" />
-                    ) : null}
-                  </div>
-                );
-              })}
+          {/* Verification controls */}
+          <div className="flex flex-col space-y-4 p-5 rounded-2xl glass-panel-subtle">
+            <div className="text-xs text-slate-300 space-y-1.5">
+              <div>Liveness Check: <span className="text-cyan-300 font-semibold">Blink your eyes naturally (any number of times)</span></div>
+              <div>Camera: <span className={cameraReady && videoLive ? 'text-emerald-400' : 'text-amber-400'}>{cameraReady && videoLive ? 'Live — Auto-Verifying' : 'Starting front camera...'}</span></div>
+              <p className="text-[11px] text-slate-400 pt-1">
+                Look at the camera and blink naturally. Your live face is matched securely on the server against your authority-approved biometric profile.
+              </p>
             </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                setAutoPipelineTriggered(true);
+                void runVerificationPipeline();
+              }}
+              disabled={running || (!cameraReady && transaction.next_stage !== 'NON_BIOMETRIC_REVIEW')}
+              className="w-full py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-bold"
+            >
+              {running ? 'Checking Blink & Matching Photo...' : error ? 'Retry Blink Check & Submit' : 'Blink & Submit Now'}
+            </button>
           </div>
         </div>
       )}
     </div>
+    </ErrorBoundary>
   );
 }

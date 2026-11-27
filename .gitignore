@@ -55,3 +55,6 @@ backend/app/ml/weights/*.tflite
 .idea/
 .DS_Store
 Thumbs.db
+
+.vercel
+.env*

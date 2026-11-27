@@ -39,8 +39,8 @@ async def generate_dynamic_qr_for_session(session_id: str, refresh_interval: int
         <APP_BASE_URL>/attend/verify?token=v1.<b64url_payload>.<hmac_hex>
     """
     now = int(time.time())
-    # Allow a 5-second scan/redirect grace beyond refresh_interval so mobile camera -> browser open succeeds
-    ttl_seconds = max(5, min(refresh_interval, 15)) + 5
+    # Fast 20-second validity window (student session is already saved for instant scan-to-face)
+    ttl_seconds = 20
     expires_at = now + ttl_seconds
     nonce = secrets.token_urlsafe(16)
     signature = sign_qr_payload(session_id, nonce, now, expires_at)

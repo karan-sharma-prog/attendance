@@ -93,9 +93,21 @@ def compute_head_pose_pnp(pts_2d: np.ndarray, width: int, height: int) -> Dict[s
 class FaceLandmarkerService:
     def __init__(self) -> None:
         self._model_path = WEIGHTS_DIR / "face_landmarker.task"
+        self._landmarker = None
 
     def is_ready(self) -> bool:
         return self._model_path.is_file() and self._model_path.stat().st_size > 1024
+
+    def _get_landmarker(self):
+        if self._landmarker is None:
+            options = FaceLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=str(self._model_path)),
+                num_faces=2,
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
+            )
+            self._landmarker = FaceLandmarker.create_from_options(options)
+        return self._landmarker
 
     def analyze_frame(self, bgr_image: np.ndarray) -> Dict[str, Any]:
         if not self.is_ready():
@@ -105,14 +117,7 @@ class FaceLandmarkerService:
         rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        options = FaceLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=str(self._model_path)),
-            num_faces=2,
-            min_face_detection_confidence=0.5,
-            min_face_presence_confidence=0.5,
-        )
-        with FaceLandmarker.create_from_options(options) as landmarker:
-            result = landmarker.detect(mp_img)
+        result = self._get_landmarker().detect(mp_img)
 
         face_count = len(result.face_landmarks)
         if face_count == 0:
@@ -177,14 +182,14 @@ def evaluate_temporal_challenges(
     ear_min = float(min(ears))
     ear_drop_ratio = (ear_baseline - ear_min) / max(ear_baseline, 1e-5)
 
-    # Count distinct blink dips (drop >= 22% below personal baseline)
-    blink_thresh = ear_baseline * 0.78
+    # Count distinct blink dips (drop >= 14% below personal open-eye baseline)
+    blink_thresh = ear_baseline * 0.86
     blink_count = 0
     in_blink = False
     for e in ears:
         if not in_blink and e < blink_thresh:
             in_blink = True
-        elif in_blink and e >= blink_thresh * 1.05:
+        elif in_blink and e >= blink_thresh * 1.03:
             blink_count += 1
             in_blink = False
     if in_blink:
@@ -193,7 +198,8 @@ def evaluate_temporal_challenges(
     results: Dict[str, bool] = {}
     for ch in required_challenges:
         if ch == "blink_twice":
-            results[ch] = blink_count >= 1 and ear_drop_ratio >= 0.20
+            # Any natural eye blink (1 or more times) passes active liveness
+            results[ch] = blink_count >= 1 and ear_drop_ratio >= 0.14
         elif ch == "open_mouth":
             results[ch] = max(mars) >= mar_threshold
         elif ch == "turn_head_left":

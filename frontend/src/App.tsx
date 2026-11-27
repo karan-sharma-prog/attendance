@@ -9,15 +9,25 @@ import {
   BellRing,
   WifiOff,
   Download,
+  LayoutDashboard,
+  ScanFace,
+  CalendarClock,
+  Settings,
+  Sun,
+  Moon,
 } from 'lucide-react';
 import {
   api,
   AuthUser,
-  getAccessToken,
+  getRefreshToken,
+  hydrateAuthTokens,
   setAuthTokens,
   SessionSummary,
   IndividualStudentReportResponse,
 } from './services/api';
+import { initNativeShell } from './services/platformService';
+import { registerDeepLinkListener } from './services/deepLinkService';
+import { initPushNotifications } from './services/pushNotificationService';
 import { LoginView } from './components/auth/LoginView';
 import { LiveSessionView } from './components/teacher/LiveSessionView';
 import { QrScannerView } from './components/student/QrScannerView';
@@ -57,6 +67,26 @@ export default function App() {
   const [showNotifs, setShowNotifs] = useState(false);
   const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
   const [installPrompt, setInstallPrompt] = useState<any>(null);
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    const saved = localStorage.getItem('sp_theme');
+    return saved === 'light' ? 'light' : 'dark';
+  });
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === 'light') root.classList.add('light-theme');
+    else root.classList.remove('light-theme');
+    localStorage.setItem('sp_theme', theme);
+    void initNativeShell(theme);
+  }, [theme]);
+
+  useEffect(() => {
+    const cleanupDeepLinks = registerDeepLinkListener((token) => {
+      setPendingQrToken(token);
+      setActiveTab('sessions');
+    });
+    return () => cleanupDeepLinks();
+  }, []);
 
   useEffect(() => {
     const onOnline = () => setIsOnline(true);
@@ -76,28 +106,56 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const token = getAccessToken();
-    if (!token) {
-      setBootstrapping(false);
-      return;
-    }
-    api
-      .get('/auth/me')
-      .then((res) => {
-        setUser({
-          user_id: res.data.id,
-          email: res.data.email,
-          full_name: res.data.full_name,
-          role: res.data.role,
-          student_id: res.data.student_id,
-          teacher_id: res.data.teacher_id,
-          enrollment_id: res.data.enrollment_id,
-        });
+    let mounted = true;
+    hydrateAuthTokens()
+      .then((token) => {
+        if (!mounted) return;
+        if (!token) {
+          setBootstrapping(false);
+          return;
+        }
+        return api
+          .get('/auth/me')
+          .then((res) => {
+            if (!mounted) return;
+            setUser({
+              user_id: res.data.id,
+              email: res.data.email,
+              full_name: res.data.full_name,
+              role: res.data.role,
+              student_id: res.data.student_id,
+              teacher_id: res.data.teacher_id,
+              enrollment_id: res.data.enrollment_id,
+            });
+            void initPushNotifications({
+              onNotificationReceived: (title, body) => {
+                setNotifications((prev) => [
+                  {
+                    id: `push-${Date.now()}`,
+                    title,
+                    message: body,
+                    type: 'INFO',
+                    is_read: false,
+                    created_at: new Date().toISOString(),
+                  },
+                  ...prev,
+                ]);
+              },
+            });
+          })
+          .catch(() => {
+            setAuthTokens(null, null);
+          })
+          .finally(() => {
+            if (mounted) setBootstrapping(false);
+          });
       })
       .catch(() => {
-        setAuthTokens(null, null);
-      })
-      .finally(() => setBootstrapping(false));
+        if (mounted) setBootstrapping(false);
+      });
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   const loadDashboardOverview = useCallback(async () => {
@@ -160,7 +218,7 @@ export default function App() {
 
   const handleLogout = async () => {
     try {
-      await api.post('/auth/logout', { refresh_token: sessionStorage.getItem('sp_refresh_token') });
+      await api.post('/auth/logout', { refresh_token: getRefreshToken() });
     } catch {
       // Clear local session regardless
     }
@@ -216,7 +274,7 @@ export default function App() {
       )}
 
       {/* Top Navigation */}
-      <header className="sticky top-0 z-50 glass-panel border-b border-white/10 px-6 py-4 flex items-center justify-between gap-4">
+      <header className="sticky top-0 z-50 glass-panel border-b border-white/10 px-4 sm:px-6 py-3.5 pt-safe flex items-center justify-between gap-3">
         <div className="flex items-center space-x-3">
           <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-500 to-cyan-400 p-[1.5px] flex items-center justify-center shadow-glass-glow">
             <div className="w-full h-full bg-[#080F1F] rounded-[10px] flex items-center justify-center">
@@ -246,6 +304,14 @@ export default function App() {
               <span className="hidden sm:inline">Install App</span>
             </button>
           )}
+
+          <button
+            onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+            title="Toggle Dark / Light Theme"
+            className="p-2 rounded-xl glass-panel-subtle hover:bg-white/10 text-slate-300 transition"
+          >
+            {theme === 'dark' ? <Sun className="w-4 h-4 text-amber-300" /> : <Moon className="w-4 h-4 text-indigo-500" />}
+          </button>
 
           <button
             onClick={() => setShowNotifs((v) => !v)}
@@ -298,8 +364,8 @@ export default function App() {
       </header>
 
       {/* Main Content Layout */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-6 space-y-6 relative z-10">
-        <div className="flex flex-wrap gap-6 border-b border-white/10 pb-3">
+      <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 pb-24 md:pb-8 space-y-6 relative z-10">
+        <div className="hidden md:flex flex-wrap gap-6 border-b border-white/10 pb-3">
           {[
             { id: 'overview', label: 'Dashboard Overview' },
             { id: 'sessions', label: user.role === 'student' ? 'Scan Attendance QR' : 'Live QR & Sessions' },
@@ -427,6 +493,36 @@ export default function App() {
         {activeTab === 'leave' && <LeaveRequestsView user={user} />}
         {activeTab === 'admin' && user.role === 'admin' && <AdminConsoleView />}
       </main>
+
+      {/* Mobile Bottom Navigation Bar */}
+      <nav className="md:hidden fixed bottom-0 inset-x-0 z-50 glass-panel border-t border-white/10 pb-safe px-2 py-2">
+        <div className="flex items-center justify-around">
+          {[
+            { id: 'overview', label: 'Home', icon: LayoutDashboard },
+            { id: 'sessions', label: user.role === 'student' ? 'Scan' : 'Live', icon: QrCode },
+            { id: 'reports', label: 'Reports', icon: BarChart3 },
+            { id: 'enrollment', label: 'Face ID', icon: ScanFace },
+            { id: 'leave', label: 'Leave', icon: CalendarClock },
+            ...(user.role === 'admin' ? [{ id: 'admin', label: 'Admin', icon: Settings }] : []),
+          ].map((item) => {
+            const Icon = item.icon;
+            const active = activeTab === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setActiveTab(item.id as any)}
+                className={`flex flex-col items-center justify-center px-2.5 py-1 rounded-xl transition-all ${
+                  active ? 'text-cyan-400 bg-indigo-500/15' : 'text-slate-400'
+                }`}
+              >
+                <Icon className="w-5 h-5" />
+                <span className="text-[10px] font-medium mt-0.5">{item.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      </nav>
     </div>
   );
 }

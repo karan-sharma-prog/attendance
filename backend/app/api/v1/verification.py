@@ -57,14 +57,8 @@ from backend.app.ml.face_recognition import ArcFaceService
 
 router = APIRouter(prefix="/verification", tags=["QR & Biometric Verification"])
 
-CHALLENGE_POOL = [
-    "blink_twice",
-    "turn_head_left",
-    "turn_head_right",
-    "open_mouth",
-    "look_straight",
-]
-ACCESSIBLE_CHALLENGE_POOL = ["blink_twice", "look_straight", "open_mouth"]
+CHALLENGE_POOL = ["blink_twice"]
+ACCESSIBLE_CHALLENGE_POOL = ["blink_twice"]
 
 _blazeface = BlazeFaceService()
 _landmarker = FaceLandmarkerService()
@@ -198,7 +192,7 @@ async def verify_qr_and_issue_transaction(
     if replay_tx.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="This QR nonce has already been used for a completed transaction.")
 
-    challenges = secrets.SystemRandom().sample(CHALLENGE_POOL, k=2)
+    challenges = ["blink_twice"]
     tx_expires_at = now + timedelta(seconds=150)
     tx = VerificationTransaction(
         session_id=sess.id,
@@ -332,12 +326,12 @@ async def get_or_switch_challenge(
     _, tx = await _get_student_and_tx(req.transaction_id, user, db, ("ISSUED", "LIVENESS_PASSED"))
 
     if req.accessible_mode:
-        new_challenges = secrets.SystemRandom().sample(ACCESSIBLE_CHALLENGE_POOL, k=2)
+        new_challenges = ["blink_twice"]
         tx.challenges_json = json.dumps(new_challenges)
         await db.commit()
         challenges = new_challenges
     else:
-        challenges = json.loads(tx.challenges_json) if tx.challenges_json else ["blink_twice", "look_straight"]
+        challenges = json.loads(tx.challenges_json) if tx.challenges_json else ["blink_twice"]
 
     return {
         "transaction_id": tx.id,
@@ -409,8 +403,8 @@ async def verify_facial_liveness(
             raise HTTPException(status_code=400, detail=f"Facial landmark alignment failed on frame {idx+1}.")
         frame_metrics.append(lm_res)
 
-        # Sample MiniFASNetV2 passive anti-spoofing on first, middle, and last frame
-        if idx in (0, len(decoded_frames) // 2, len(decoded_frames) - 1):
+        # Run MiniFASNetV2 passive anti-spoofing on the middle frame for fast response
+        if idx == len(decoded_frames) // 2:
             anti = _minifasnet.predict_liveness(
                 bgr, bf_dets[0]["bbox"], threshold=settings.MINIFASNET_LIVENESS_THRESHOLD
             )
@@ -419,7 +413,7 @@ async def verify_facial_liveness(
     avg_live_score = float(np.mean(spoof_scores)) if spoof_scores else 0.0
     passive_passed = avg_live_score >= settings.MINIFASNET_LIVENESS_THRESHOLD
 
-    required_challenges = json.loads(tx.challenges_json) if tx.challenges_json else ["blink_twice", "look_straight"]
+    required_challenges = json.loads(tx.challenges_json) if tx.challenges_json else ["blink_twice"]
     challenge_eval = evaluate_temporal_challenges(
         frame_metrics,
         required_challenges,
@@ -456,7 +450,7 @@ async def verify_facial_liveness(
         await db.commit()
         raise HTTPException(
             status_code=400,
-            detail=f"Active liveness challenge incomplete ({', '.join(c.replace('_', ' ') for c in failed)}). Please retry.",
+            detail="Eye blink not detected. Please blink your eyes naturally while facing the camera and retry.",
         )
 
     tx.status = "LIVENESS_PASSED"
@@ -688,7 +682,12 @@ async def complete_attendance_decision_engine(
             "student_id": student.id,
             "student_name": user.full_name,
             "roll_number": student.roll_number,
+            "subject_code": subject.code if subject else "UNKNOWN",
+            "subject_name": subject.name if subject else "Unknown Subject",
+            "classroom": sess.classroom or "Classroom",
             "status": "PRESENT",
+            "day": now.strftime("%A"),
+            "date": now.strftime("%Y-%m-%d"),
             "timestamp": now.isoformat(),
         },
     )

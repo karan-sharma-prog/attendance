@@ -1,6 +1,20 @@
 import axios from 'axios';
+import { isNativePlatform } from './platformService';
+import { getSecureItem, setSecureItem, removeSecureItem } from './secureStorageService';
 
-const API_BASE = import.meta.env.VITE_API_URL || '/api/v1';
+function resolveApiBaseUrl(): string {
+  const envUrl = import.meta.env.VITE_API_URL?.trim();
+  if (envUrl) {
+    return envUrl.endsWith('/api/v1') ? envUrl : `${envUrl.replace(/\/+$/, '')}/api/v1`;
+  }
+  if (isNativePlatform()) {
+    // Native Capacitor builds cannot rely on Vite's relative /api proxy
+    return 'https://smartpresence.vercel.app/api/v1';
+  }
+  return '/api/v1';
+}
+
+export const API_BASE = resolveApiBaseUrl();
 
 export const api = axios.create({
   baseURL: API_BASE,
@@ -9,22 +23,43 @@ export const api = axios.create({
   },
 });
 
-// Keep tokens in memory + sessionStorage (never store biometric data or QR secrets in localStorage)
-let accessToken: string | null = sessionStorage.getItem('sp_access_token');
-let refreshToken: string | null = sessionStorage.getItem('sp_refresh_token');
+// Keep tokens in memory + persistent storage (Keystore/Keychain on native, localStorage on web so QR links stay signed in)
+let accessToken: string | null = typeof localStorage !== 'undefined' ? localStorage.getItem('sp_access_token') : null;
+let refreshToken: string | null = typeof localStorage !== 'undefined' ? localStorage.getItem('sp_refresh_token') : null;
+
+export async function hydrateAuthTokens(): Promise<string | null> {
+  if (accessToken) return accessToken;
+  const [storedAccess, storedRefresh] = await Promise.all([
+    getSecureItem('sp_access_token'),
+    getSecureItem('sp_refresh_token'),
+  ]);
+  accessToken = storedAccess;
+  refreshToken = storedRefresh;
+  return accessToken;
+}
 
 export function setAuthTokens(access: string | null, refresh: string | null) {
   accessToken = access;
   refreshToken = refresh;
-  if (access) sessionStorage.setItem('sp_access_token', access);
-  else sessionStorage.removeItem('sp_access_token');
+  if (access) {
+    void setSecureItem('sp_access_token', access);
+  } else {
+    void removeSecureItem('sp_access_token');
+  }
 
-  if (refresh) sessionStorage.setItem('sp_refresh_token', refresh);
-  else sessionStorage.removeItem('sp_refresh_token');
+  if (refresh) {
+    void setSecureItem('sp_refresh_token', refresh);
+  } else {
+    void removeSecureItem('sp_refresh_token');
+  }
 }
 
 export function getAccessToken(): string | null {
   return accessToken;
+}
+
+export function getRefreshToken(): string | null {
+  return refreshToken;
 }
 
 api.interceptors.request.use((config) => {

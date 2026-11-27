@@ -1,3 +1,5 @@
+import os
+# Existing imports...
 from pydantic_settings import BaseSettings
 from pydantic import field_validator
 from typing import List, Optional, Union
@@ -17,28 +19,35 @@ class Settings(BaseSettings):
     # Server Binding & Public/LAN Base URL for QR Verification Links
     HOST: str = "0.0.0.0"
     PORT: int = 8000
-    FRONTEND_URL: str = "https://localhost:5173"
-    APP_BASE_URL: str = "https://localhost:5173"
+    FRONTEND_URL: str = os.getenv("VERCEL_URL", "https://localhost:5173")
+    APP_BASE_URL: str = os.getenv("VERCEL_URL", "https://localhost:5173")
+    CORS_ORIGINS: Union[List[str], str] = os.getenv(
+        "VERCEL_URL", "https://localhost:5173"
+    )
     DEFAULT_GEOFENCE_RADIUS_METERS: float = 150.0
-    CORS_ORIGINS: Union[List[str], str] = [
-        "https://localhost:5173",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ]
 
     @field_validator("CORS_ORIGINS", mode="before")
     @classmethod
     def assemble_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
+        origins: List[str] = []
         if isinstance(v, str):
             if v.startswith("[") and v.endswith("]"):
                 try:
-                    return json.loads(v)
+                    origins = json.loads(v)
                 except Exception:
-                    pass
-            return [i.strip() for i in v.split(",") if i.strip()]
+                    origins = [i.strip() for i in v.split(",") if i.strip()]
+            else:
+                origins = [i.strip() for i in v.split(",") if i.strip()]
         elif isinstance(v, list):
-            return v
-        return ["http://localhost:5173", "http://127.0.0.1:5173"]
+            origins = list(v)
+        else:
+            origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+        # Always permit Capacitor Android/iOS native WebView origins
+        for native_origin in ("capacitor://localhost", "https://localhost", "http://localhost"):
+            if native_origin not in origins:
+                origins.append(native_origin)
+        return origins
     
     # Neon PostgreSQL Database Connection Strings
     DATABASE_URL: Optional[str] = None

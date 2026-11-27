@@ -79,6 +79,8 @@ export function LoginView({ onLoginSuccess, pendingQrDetected = false }: LoginVi
               <Mail className="w-4 h-4 text-slate-400 absolute left-3.5 top-3" />
               <input
                 type="text"
+                name="username"
+                autoComplete="username"
                 required
                 value={identifier}
                 onChange={(e) => setIdentifier(e.target.value)}
@@ -94,6 +96,8 @@ export function LoginView({ onLoginSuccess, pendingQrDetected = false }: LoginVi
               <Lock className="w-4 h-4 text-slate-400 absolute left-3.5 top-3" />
               <input
                 type="password"
+                name="password"
+                autoComplete="current-password"
                 required
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
